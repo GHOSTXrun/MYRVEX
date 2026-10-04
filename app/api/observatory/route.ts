@@ -1,0 +1,3 @@
+import {observatory} from '@/lib/observatory';
+export const dynamic='force-dynamic';let cache:any=null;let pending:Promise<any>|null=null;
+export async function GET(){try{if(!cache||Date.now()-cache.serverTime>20000){if(!pending)pending=observatory().then(d=>cache=d).finally(()=>pending=null);await pending;}return Response.json(cache,{headers:{'Cache-Control':'no-store'}})}catch{return Response.json({error:'Market connection interrupted',market:cache?{...cache.market,source:'stale'}:{source:'unavailable',marketCap:null},population:cache?.population??0,serverTime:Date.now()},{headers:{'Cache-Control':'no-store'}})}}

@@ -1,0 +1,32 @@
+import {readFile,writeFile,mkdir} from 'node:fs/promises';
+import ts from 'typescript';
+import {DatabaseSync} from 'node:sqlite';
+import assert from 'node:assert/strict';
+import {Keypair,TransactionMessage,VersionedTransaction,SystemProgram} from '@solana/web3.js';
+const dir=new URL('../.sites-runtime/backend-tests/',import.meta.url);await mkdir(dir,{recursive:true});
+for(const [file,name]of [['lib/colony.ts','colony'],['app/api/colony/route.ts','api'],['app/api/trade/route.ts','trade']]){let code=await readFile(new URL('../'+file,import.meta.url),'utf8');code=code.replaceAll("'cloudflare:workers'","'./testenv.mjs'").replaceAll("'@/lib/colony'","'./colony.mjs'");await writeFile(new URL(name+'.mjs',dir),ts.transpileModule(code,{compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.ES2022}}).outputText);}
+await writeFile(new URL('testenv.mjs',dir),'export const env = {};');
+const {env}=await import(new URL('testenv.mjs',dir));const sql=new DatabaseSync(':memory:');sql.exec(await readFile(new URL('../drizzle/0000_careless_baron_strucker.sql',import.meta.url),'utf8'));
+function prep(query,values=[]){return{bind:(...a)=>prep(query,a),run:async()=>{const r=sql.prepare(query).run(...values);return{meta:{changes:Number(r.changes)},success:true}},first:async()=>sql.prepare(query).get(...values)||null,all:async()=>({results:sql.prepare(query).all(...values)})};}
+env.DB={prepare:prep,batch:async a=>{sql.exec('BEGIN');try{const r=[];for(const x of a)r.push(await x.run());sql.exec('COMMIT');return r}catch(e){sql.exec('ROLLBACK');throw e}}};env.ADMIN_EMAIL='owner@test.example';
+const api=await import(new URL('api.mjs',dir)),trade=await import(new URL('trade.mjs',dir));
+const req=(body,admin=true,path='colony')=>new Request('https://colony.test/api/'+path,{method:body?'POST':'GET',headers:{origin:'https://colony.test','content-type':'application/json',...(admin?{'oai-authenticated-user-email':'owner@test.example'}:{})},body:body?JSON.stringify(body):undefined});
+let r=await api.GET(req());assert.equal(r.status,200);assert.equal((await r.json()).population,37);
+r=await api.POST(req({action:'dispatch'},false));assert.equal(r.status,403);
+r=await api.POST(req({action:'settings',value:{tradeSol:1}}));assert.equal(r.status,400);
+r=await api.POST(req({action:'dispatch',ant:2}));assert.equal(r.status,200);const paperId=(await r.json()).id;
+r=await api.POST(req({action:'dispatch',ant:2}));assert.equal(r.status,409);
+sql.prepare('UPDATE missions SET created=? WHERE id=?').run(Date.now()-25000,paperId);
+let state=await (await api.GET(req())).json();assert.equal(state.totals.completed,1);await api.GET(req());assert.equal(sql.prepare("SELECT COUNT(*) AS n FROM events WHERE id=?").get('done-'+paperId).n,1);
+r=await trade.POST(req({action:'order',wallet:Keypair.generate().publicKey.toBase58()}));assert.equal(r.status,409);
+const signer=Keypair.generate(),mint=Keypair.generate().publicKey.toBase58();env.JUPITER_API_KEY='test-key';env.LIVE_TRADING_ENABLED='true';await api.POST(req({action:'settings',value:{mint,live:true,dailySol:.01}}));
+let executions=0;const realFetch=fetch;globalThis.fetch=async(url,init)=>{url=String(url);if(url.includes('dexscreener'))return Response.json([]);if(url.includes('/order?')){const u=new URL(url);const tx=new VersionedTransaction(new TransactionMessage({payerKey:signer.publicKey,recentBlockhash:Keypair.generate().publicKey.toBase58(),instructions:[SystemProgram.transfer({fromPubkey:signer.publicKey,toPubkey:Keypair.generate().publicKey,lamports:10000000})]}).compileToV0Message());return Response.json({transaction:Buffer.from(tx.serialize()).toString('base64'),requestId:'test-order',inputMint:u.searchParams.get('inputMint'),outputMint:u.searchParams.get('outputMint'),inAmount:u.searchParams.get('amount'),outAmount:'1000',slippageBps:50,router:'mock'});}if(url.endsWith('/execute')){executions++;return Response.json({status:'Success',signature:'test-signature',totalOutputAmount:'1000'});}throw Error('Unexpected external call');};
+r=await trade.POST(req({action:'order',wallet:signer.publicKey.toBase58()}));assert.equal(r.status,200);const order=await r.json();r=await trade.POST(req({action:'order',wallet:signer.publicKey.toBase58()}));assert.equal(r.status,409);
+const tx=VersionedTransaction.deserialize(Buffer.from(order.transaction,'base64'));tx.sign([signer]);const signedTransaction=Buffer.from(tx.serialize()).toString('base64');
+const altered=VersionedTransaction.deserialize(Buffer.from(order.transaction,'base64'));altered.message.recentBlockhash=Keypair.generate().publicKey.toBase58();altered.sign([signer]);r=await trade.POST(req({action:'execute',id:order.id,signedTransaction:Buffer.from(altered.serialize()).toString('base64')}));assert.equal(r.status,400);
+r=await trade.POST(req({action:'execute',id:order.id,signedTransaction}));assert.equal(r.status,200);assert.equal((await r.json()).status,'Success');r=await trade.POST(req({action:'execute',id:order.id,signedTransaction}));assert.equal(r.status,200);assert.equal(executions,1);
+r=await trade.POST(req({action:'order',wallet:signer.publicKey.toBase58()}));assert.equal(r.status,409);
+r=await trade.POST(req({action:'order',wallet:signer.publicKey.toBase58(),positionId:order.id}));assert.equal(r.status,200);const exitOrder=await r.json();assert.equal(exitOrder.inAmount,'1000');
+r=await trade.POST(req({action:'cancel',id:exitOrder.id}));assert.equal(r.status,200);
+await api.POST(req({action:'settings',value:{paused:true}}));r=await trade.POST(req({action:'order',wallet:signer.publicKey.toBase58()}));assert.equal(r.status,409);r=await api.POST(req({action:'dispatch',ant:1}));assert.equal(r.status,400);
+globalThis.fetch=realFetch;sql.close();console.log('PASS: persistence, auth, duplicate paper job, completion idempotency, live gate, one pending order, daily budget, signing, duplicate execution, position exit and pause. No real transaction sent.');
